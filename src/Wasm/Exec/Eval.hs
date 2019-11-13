@@ -166,10 +166,10 @@ data Config f m = Config
 
 makeLenses ''Config
 
-type EvalT m a = ExceptT EvalError m a
-type CEvalT f m a = ReaderT (Config f m) (ExceptT EvalError m) a
+type Eval s = ExceptT EvalError (ST s)
+type CEval f s a = ReaderT (Config f (ST s)) (Eval s) a
 
-getInst :: Monad m => ModuleRef -> CEvalT f m (ModuleInst f m)
+getInst :: ModuleRef -> CEval f s (ModuleInst f (ST s))
 getInst ref = do
   mres <- view (configModules.at ref)
   case mres of
@@ -177,7 +177,7 @@ getInst ref = do
       EvalCrashError def $ "Reference to unknown module #" ++ show ref
     Just x  -> return x
 
-getFrameInst :: Monad m => CEvalT f m (ModuleInst f m)
+getFrameInst :: CEval f s (ModuleInst f (ST s))
 getFrameInst = view (configFrame.frameInst)
 
 newConfig :: IntMap (ModuleInst f m) -> ModuleInst f m -> Config f m
@@ -191,41 +191,34 @@ plain :: Regioned f => f (Instr f) -> f (AdminInstr f m)
 plain e = Plain (value e) @@ region e
 {-# INLINE plain #-}
 
-lookup :: (Regioned f, Monad m)
-       => String -> s -> Lens' s [a] -> Var f -> EvalT m a
+lookup :: Regioned f => String -> b -> Lens' b [a] -> Var f -> Eval s a
 lookup category inst l x@(value -> x') =
   if fromIntegral x' < length (inst^.l)
   then pure $ inst^?!l.ix (fromIntegral x')
   else throwError $
     EvalCrashError (region x) ("undefined " <> category <> " " <> show x')
 
-type_ :: (Regioned f, Monad m)
-      => ModuleInst f m -> Var f -> EvalT m FuncType
+type_ :: Regioned f => ModuleInst f (ST s) -> Var f -> Eval s FuncType
 type_ inst = fmap value . lookup "type" inst (miModule.moduleTypes)
 
-func :: (Regioned f, Monad m)
-     => ModuleInst f m -> Var f -> EvalT m (ModuleFunc f m)
+func :: Regioned f => ModuleInst f (ST s) -> Var f -> Eval s (ModuleFunc f (ST s))
 func inst = lookup "function" inst miFuncs
 
-table :: (Regioned f, Monad m)
-      => ModuleInst f m -> Var f -> EvalT m (TableInst m (ModuleFunc f m))
+table :: Regioned f => ModuleInst f m -> Var f -> Eval s (TableInst m (ModuleFunc f m))
 table inst = lookup "table" inst miTables
 
-memory :: (Regioned f, Monad m)
-       => ModuleInst f m -> Var f -> EvalT m (Memory.MemoryInst m)
+memory :: Regioned f => ModuleInst f m -> Var f -> Eval s (Memory.MemoryInst m)
 memory inst = lookup "memory" inst miMemories
 
-global :: (Regioned f, Monad m)
-       => ModuleInst f m -> Var f -> EvalT m (Global.GlobalInst m)
+global :: Regioned f => ModuleInst f m -> Var f -> Eval s (Global.GlobalInst m)
 global inst = lookup "global" inst miGlobals
 
-local :: (Regioned f, Monad m)
-      => Frame f m -> Var f -> EvalT m (Mutable m Value)
+local :: Regioned f => Frame f m -> Var f -> Eval s (Mutable m Value)
 local frame = lookup "local" frame frameLocals
 
-elem :: (Regioned f, MonadRef m)
-     => ModuleInst f m -> Var f -> Table.Index -> Region
-     -> EvalT m (ModuleFunc f m)
+elem :: Regioned f
+     => ModuleInst f (ST s) -> Var f -> Table.Index -> Region
+     -> Eval s (ModuleFunc f (ST s))
 elem inst x i at' = do
   t <- table inst x
   x <- lift $ Table.load t i
@@ -234,14 +227,13 @@ elem inst x i at' = do
       EvalTrapError at' ("uninitialized element " ++ show i)
     Just f -> pure f
 
-funcElem :: (Regioned f, MonadRef m)
-         => ModuleInst f m -> Var f -> Table.Index -> Region
-         -> EvalT m (ModuleFunc f m)
+funcElem :: Regioned f
+         => ModuleInst f (ST s) -> Var f -> Table.Index -> Region
+         -> Eval s (ModuleFunc f (ST s))
 funcElem = elem
 {-# INLINE funcElem #-}
 
-takeFrom :: Monad m
-         => Int -> Stack a -> Region -> EvalT m (Stack a)
+takeFrom :: Int -> Stack a -> Region -> Eval s (Stack a)
 takeFrom n vs at' =
   if n > length vs
   then throwError $ EvalCrashError at' "stack underflow"
@@ -253,8 +245,7 @@ partialZip xs [] = map Left xs
 partialZip [] ys = map (Right . Left) ys
 partialZip (x:xs) (y:ys) = Right (Right (x, y)) : partialZip xs ys
 
-checkTypes :: Monad m
-           => Region -> [ValueType] -> [Value] -> EvalT m ()
+checkTypes :: Region -> [ValueType] -> [Value] -> Eval s ()
 checkTypes at ts xs = forM_ (partialZip ts xs) $ \case
   Left t ->
     throwError $ EvalCrashError at $ "missing argument of type " ++ show t
@@ -277,7 +268,7 @@ checkTypes at ts xs = forM_ (partialZip ts xs) $ \case
  *   c : config
  -}
 
-type EvalCont f m r = Stack Value -> DList (f (AdminInstr f m)) -> CEvalT f m r
+type EvalCont f s r = Stack Value -> DList (f (AdminInstr f (ST s))) -> CEval f s r
 
 -- Make sure that our use of ReaderT does not get in the way of
 -- eta-expansion. See
@@ -285,10 +276,10 @@ type EvalCont f m r = Stack Value -> DList (f (AdminInstr f m)) -> CEvalT f m r
 etaReaderT :: ReaderT r m a -> ReaderT r m a
 etaReaderT = ReaderT . oneShot . runReaderT
 
-instr :: (Regioned f, {-Show1 f,-} MonadRef m)
+instr :: Regioned f
       => Stack Value -> Region -> Instr f
-      -> EvalCont f m r
-      -> CEvalT f m r
+      -> EvalCont f s r
+      -> CEval f s r
 instr vs at e' k = etaReaderT $ case (unFix e', vs) of
   (Unreachable, vs)              -> {-# SCC step_Unreachable #-}
     k vs (Trapping "unreachable executed" @@ at :)
@@ -473,16 +464,11 @@ instr vs at e' k = etaReaderT $ case (unFix e', vs) of
 
 {-# SPECIALIZE instr
       :: Stack Value -> Region -> Instr Identity
-      -> (EvalCont Identity IO r)
-      -> CEvalT Identity IO r #-}
+      -> (EvalCont Identity s r)
+      -> CEval Identity s r #-}
 
-{-# SPECIALIZE instr
-      :: Stack Value -> Region -> Instr Identity
-      -> (EvalCont Identity (ST s) r)
-      -> CEvalT Identity (ST s) r #-}
-
-step :: (Regioned f, MonadRef m, Show1 f)
-     => Code f m -> (Code f m -> CEvalT f m r) -> CEvalT f m r
+step :: (Regioned f, Show1 f)
+     => Code f (ST s) -> (Code f (ST s) -> CEval f s r) -> CEval f s r
 step c k' = etaReaderT $ case c of
   Code _ [] -> error "Cannot step without instructions"
   Code vs (e:es) ->
@@ -579,15 +565,11 @@ step c k' = etaReaderT $ case c of
                 -- with Crash (_, msg) -> EvalCrashError at msg)
 
 {-# SPECIALIZE step
-      :: Code Identity IO -> (Code Identity IO -> CEvalT Identity IO r)
-      -> CEvalT Identity IO r #-}
+      :: Code Identity (ST s) -> (Code Identity (ST s) -> CEval Identity s r)
+      -> CEval Identity s r #-}
 
-{-# SPECIALIZE step
-      :: Code Identity (ST s) -> (Code Identity (ST s) -> CEvalT Identity (ST s) r)
-      -> CEvalT Identity (ST s) r #-}
-
-eval :: (Regioned f, MonadRef m, Show1 f)
-     => Code f m -> CEvalT f m (Stack Value)
+eval :: (Regioned f, Show1 f)
+     => Code f (ST s) -> CEval f s (Stack Value)
 eval c@(Code vs es) = etaReaderT $ case es of
   [] -> pure vs
   t@(value -> Trapping msg) : _ ->
@@ -595,19 +577,16 @@ eval c@(Code vs es) = etaReaderT $ case es of
   _ -> step c eval
 
 {-# SPECIALIZE eval
-      :: Code Identity IO -> CEvalT Identity IO (Stack Value) #-}
-
-{-# SPECIALIZE eval
-      :: Code Identity (ST s) -> CEvalT Identity (ST s) (Stack Value) #-}
+      :: Code Identity (ST s) -> CEval Identity s (Stack Value) #-}
 
 {- Functions & Constants -}
 
-invoke :: (Regioned f, MonadRef m, Show1 f)
-       => IntMap (ModuleInst f m)
-       -> ModuleInst f m
-       -> ModuleFunc f m
+invoke :: (Regioned f, Show1 f)
+       => IntMap (ModuleInst f (ST s))
+       -> ModuleInst f (ST s)
+       -> ModuleFunc f (ST s)
        -> [Value]
-       -> EvalT m [Value]
+       -> Eval s [Value]
 invoke mods inst func vs = do
   let (at, inst') = case func of
         Func.AstFunc _ i f -> (region f, mods^?!ix i)
@@ -620,22 +599,15 @@ invoke mods inst func vs = do
   --   Exhaustion.error at "call stack exhausted"
 
 {-# SPECIALIZE invoke
-      :: IntMap (ModuleInst Identity IO)
-      -> ModuleInst Identity IO
-      -> ModuleFunc Identity IO
-      -> [Value]
-      -> EvalT IO [Value] #-}
-
-{-# SPECIALIZE invoke
       :: IntMap (ModuleInst Identity (ST s))
       -> ModuleInst Identity (ST s)
       -> ModuleFunc Identity (ST s)
       -> [Value]
-      -> EvalT (ST s) [Value] #-}
+      -> Eval s [Value] #-}
 
-invokeByName :: (Regioned f, MonadRef m, Show1 f)
-             => IntMap (ModuleInst f m) -> ModuleInst f m -> Text -> [Value]
-             -> EvalT m [Value]
+invokeByName :: (Regioned f, Show1 f)
+             => IntMap (ModuleInst f (ST s)) -> ModuleInst f (ST s) -> Text -> [Value]
+             -> Eval s [Value]
 invokeByName mods inst name vs = do
   -- traceM $ "invokeByName " ++ unpack name
   case inst ^. miExports.at name of
@@ -644,26 +616,22 @@ invokeByName mods inst name vs = do
       "Cannot invoke export " ++ unpack name ++ ": " ++ show e
 
 {-# SPECIALIZE invokeByName
-      :: IntMap (ModuleInst Identity IO)
-      -> ModuleInst Identity IO -> Text -> [Value] -> EvalT IO [Value] #-}
-
-{-# SPECIALIZE invokeByName
       :: IntMap (ModuleInst Identity (ST s))
-      -> ModuleInst Identity (ST s) -> Text -> [Value] -> EvalT (ST s) [Value] #-}
+      -> ModuleInst Identity (ST s) -> Text -> [Value] -> Eval s [Value] #-}
 
-getByName :: (Regioned f, Show1 f, MonadRef m)
-          => ModuleInst f m -> Text -> EvalT m Value
+getByName :: (Regioned f, Show1 f)
+          => ModuleInst f (ST s) -> Text -> Eval s Value
 getByName inst name = case inst ^. miExports.at name of
   Just (ExternGlobal g) -> lift $ getMut (g^.Global.giContent)
   e -> throwError $ EvalCrashError def $
     "Cannot get exported global " ++ unpack name ++ ": " ++ show e
 
 {-# SPECIALIZE getByName
-      :: ModuleInst Identity IO -> Text -> EvalT IO Value #-}
+      :: ModuleInst Identity (ST s) -> Text -> Eval s Value #-}
 
-evalConst :: (Regioned f, MonadRef m, Show1 f)
-          => IntMap (ModuleInst f m)
-          -> ModuleInst f m -> Expr f -> EvalT m Value
+evalConst :: (Regioned f, Show1 f)
+          => IntMap (ModuleInst f (ST s))
+          -> ModuleInst f (ST s) -> Expr f -> Eval s Value
 evalConst mods inst expr = do
   xs <- runReaderT
     (eval (Code [] (map plain (value expr))))
@@ -673,49 +641,47 @@ evalConst mods inst expr = do
     _ -> throwError $
       EvalCrashError (region expr) "wrong number of results on stack"
 
-i32 :: Monad m => Value -> Region -> EvalT m Int32
+i32 :: Value -> Region -> Eval s Int32
 i32 v at = case v of
   I32 i -> pure i
   _ -> throwError $ EvalCrashError at "type error: i32 value expected"
 
 {- Modules -}
 
-createFunc :: (Regioned f, Monad m)
-           => ModuleInst f m -> ModuleRef -> f (Func f)
-           -> EvalT m (ModuleFunc f m)
+createFunc :: Regioned f
+           => ModuleInst f (ST s) -> ModuleRef -> f (Func f)
+           -> Eval s (ModuleFunc f (ST s))
 createFunc inst ref f = do
   ty <- type_ inst (value f^.funcType)
   pure $ Func.alloc ty ref f
 
-createHostFunc :: FuncType -> ([Value] -> [Value]) -> ModuleFunc f m
+createHostFunc :: FuncType -> ([Value] -> [Value]) -> ModuleFunc f (ST s)
 createHostFunc = Func.allocHost
 
-createHostFuncEff :: FuncType -> ([Value] -> m (Either String [Value])) -> ModuleFunc f m
+createHostFuncEff :: FuncType -> ([Value] -> (ST s) (Either String [Value])) -> ModuleFunc f (ST s)
 createHostFuncEff = Func.allocHostEff
 
-createTable :: (Regioned f, MonadRef m)
-            => Table f -> EvalT m (TableInst m (ModuleFunc f m))
+createTable :: Regioned f => Table f -> Eval s (TableInst (ST s) (ModuleFunc f (ST s)))
 createTable tab = do
   eres <- lift $ runExceptT $ Table.alloc (value tab)
   case eres of
     Left err -> throwError $ EvalTableError (region tab) err
     Right g  -> pure g
 
-liftMem :: Monad m
-        => Region -> ExceptT Memory.MemoryError m a -> EvalT m a
+liftMem :: Region -> ExceptT Memory.MemoryError (ST s) a -> Eval s a
 liftMem at act = do
   eres <- lift $ runExceptT act
   case eres of
     Left err -> throwError $ EvalMemoryError at err
     Right x  -> pure x
 
-createMemory :: (Regioned f, MonadRef m)
-             => Memory f -> EvalT m (Memory.MemoryInst m)
+createMemory :: Regioned f
+             => Memory f -> Eval s (Memory.MemoryInst (ST s))
 createMemory mem = liftMem (region mem) $ Memory.alloc (value mem)
 
-createGlobal :: (Regioned f, MonadRef m, Show1 f)
-             => IntMap (ModuleInst f m) -> ModuleInst f m -> f (Global f)
-             -> EvalT m (Global.GlobalInst m)
+createGlobal :: (Regioned f, Show1 f)
+             => IntMap (ModuleInst f (ST s)) -> ModuleInst f (ST s) -> f (Global f)
+             -> Eval s (Global.GlobalInst (ST s))
 createGlobal mods inst x@(value -> glob) = do
   v <- evalConst mods inst (glob^.globalValue)
   eres <- lift $ runExceptT $ Global.alloc (glob^.globalType) v
@@ -723,8 +689,8 @@ createGlobal mods inst x@(value -> glob) = do
     Left err -> throwError $ EvalGlobalError (region x) err
     Right g  -> pure g
 
-createExport :: (Regioned f, Monad m)
-             => ModuleInst f m -> f (Export f) -> EvalT m (ExportInst f m)
+createExport :: Regioned f
+             => ModuleInst f (ST s) -> f (Export f) -> Eval s (ExportInst f (ST s))
 createExport inst (value -> ex) = do
   ext <- case ex^.exportDesc of
     FuncExport   x -> ExternFunc   <$> func inst x
@@ -733,9 +699,9 @@ createExport inst (value -> ex) = do
     GlobalExport x -> ExternGlobal <$> global inst x
   pure $ M.singleton (ex^.exportName) ext
 
-initTable :: (Regioned f, Show1 f, MonadRef m)
-          => IntMap (ModuleInst f m) -> ModuleInst f m -> f (TableSegment f)
-          -> EvalT m ()
+initTable :: (Regioned f, Show1 f)
+          => IntMap (ModuleInst f (ST s)) -> ModuleInst f (ST s) -> f (TableSegment f)
+          -> Eval s ()
 initTable mods inst s@(value -> seg) = do
   tab <- table inst (seg^.segmentIndex)
   c <- evalConst mods inst (seg^.segmentOffset)
@@ -747,9 +713,9 @@ initTable mods inst s@(value -> seg) = do
   fs <- traverse (func inst) (seg^.segmentInit)
   lift $ Table.blit tab offset (V.fromList fs)
 
-initMemory :: (Regioned f, Show1 f, MonadRef m)
-           => IntMap (ModuleInst f m) -> ModuleInst f m -> f (MemorySegment f)
-           -> EvalT m ()
+initMemory :: (Regioned f, Show1 f)
+           => IntMap (ModuleInst f (ST s)) -> ModuleInst f (ST s) -> f (MemorySegment f)
+           -> Eval s ()
 initMemory mods inst s@(value -> seg) = do
   mem <- memory inst (seg^.segmentIndex)
   c <- evalConst mods inst (seg^.segmentOffset)
@@ -763,11 +729,11 @@ initMemory mods inst s@(value -> seg) = do
     Memory.storeBytes mem (fromIntegral offset)
                       (V.fromList (B.unpack (seg^.segmentInit)))
 
-addImport :: (Regioned f, MonadRef m)
-          => ModuleInst f m
-          -> Extern f m
+addImport :: (Regioned f)
+          => ModuleInst f (ST s)
+          -> Extern f (ST s)
           -> f (Import f)
-          -> EvalT m (ModuleInst f m)
+          -> Eval s (ModuleInst f (ST s))
 addImport inst ext im = do
   typ <- lift $ externTypeOf ext
   if not (matchExternType typ (importTypeFor (inst^.miModule) (value im)))
@@ -778,11 +744,11 @@ addImport inst ext im = do
       ExternMemory mem  -> inst & miMemories %~ (mem  :)
       ExternGlobal glob -> inst & miGlobals  %~ (glob :)
 
-resolveImports :: (Regioned f, Show1 f, MonadRef m)
+resolveImports :: (Regioned f, Show1 f)
                => Map Text ModuleRef
-               -> IntMap (ModuleInst f m)
-               -> ModuleInst f m
-               -> EvalT m (ModuleInst f m)
+               -> IntMap (ModuleInst f (ST s))
+               -> ModuleInst f (ST s)
+               -> Eval s (ModuleInst f (ST s))
 resolveImports names mods inst = flip execStateT inst $
   forM_ (reverse (inst^.miModule.moduleImports)) $ \im -> do
     let im' = value im
@@ -801,11 +767,11 @@ resolveImports names mods inst = flip execStateT inst $
               m' <- lift $ addImport m ext im
               put m'
 
-initialize :: (Regioned f, Show1 f, MonadRef m)
+initialize :: (Regioned f, Show1 f)
            => f (Module f)
            -> Map Text ModuleRef
-           -> IntMap (ModuleInst f m)
-           -> EvalT m (ModuleRef, ModuleInst f m)
+           -> IntMap (ModuleInst f (ST s))
+           -> Eval s (ModuleRef, ModuleInst f (ST s))
 initialize (value -> mod) names mods = do
   inst <- resolveImports names mods (emptyModuleInst mod)
   let ref = nextKey mods
@@ -835,12 +801,6 @@ initialize (value -> mod) names mods = do
       lift $ invoke (IM.insert ref inst3 mods) inst3 f []
 
   pure (ref, inst')
-
-{-# SPECIALIZE initialize
-           :: Identity (Module Identity)
-           -> Map Text ModuleRef
-           -> IntMap (ModuleInst Identity IO)
-           -> EvalT IO (ModuleRef, ModuleInst Identity IO) #-}
 
 nextKey :: IntMap a -> IM.Key
 nextKey m = go (max 1 (IM.size m))

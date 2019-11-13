@@ -29,6 +29,7 @@ import           Control.Applicative
 import           Control.Exception.Lifted hiding (try)
 import           Control.Monad
 import           Control.Monad.Except
+import           Control.Monad.ST
 import           Control.Monad.Trans.Control
 import           Control.Monad.Trans.State
 import           Data.ByteString.Lazy (ByteString)
@@ -76,15 +77,15 @@ class (Show (Value w), Eq (Value w)) => WasmEngine w m where
   decodeModule :: ByteString -> Either String (Module w)
 
   initializeModule
-    :: Module w -> Map Text ModuleRef -> IntMap (ModuleInst w m)
-    -> m (Either String (ModuleRef, ModuleInst w m))
+    :: Module w -> Map Text ModuleRef -> IntMap (ModuleInst w (ST s))
+    -> ST s (Either String (ModuleRef, ModuleInst w (ST s)))
 
   invokeByName
-    :: IntMap (ModuleInst w m) -> ModuleInst w m -> Text
-    -> [Value w] -> m (Either String ([Value w], ModuleInst w m))
+    :: IntMap (ModuleInst w (ST s)) -> ModuleInst w (ST s) -> Text
+    -> [Value w] -> ST s (Either String ([Value w], ModuleInst w (ST s)))
   getByName
-    :: ModuleInst w m -> Text
-    -> m (Either String (Value w, ModuleInst w m))
+    :: ModuleInst w (ST s) -> Text
+    -> ST s (Either String (Value w, ModuleInst w (ST s)))
 
 type Script w = [Cmd w]
 type Name = Text
