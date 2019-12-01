@@ -6,7 +6,7 @@
 {-# LANGUAGE TypeApplications #-}
 
 module Wasm.Runtime.Memory
-  ( MemoryInst(..)
+  ( MemoryInst
   , doubleFromBits, doubleToBits
   , floatFromBits, floatToBits
   , typeOf
@@ -19,8 +19,9 @@ module Wasm.Runtime.Memory
   , storeValue
   , storePacked
   , loadPacked
-  , loadBytes
   , loadValue
+  , exportMemory
+  , importMemory
   ) where
 
 import           Control.Exception
@@ -34,8 +35,6 @@ import           Data.Primitive.MutVar
 import           Data.Primitive.ByteArray
 import qualified Data.Primitive.ByteArray.Unaligned    as UABA
 import qualified Data.Primitive.ByteArray.LittleEndian as LEBA
-import           Data.Vector (Vector)
-import qualified Data.Vector as V
 import           Data.Word
 import           GHC.ST (runST, ST)
 import           Lens.Micro.Platform
@@ -124,35 +123,18 @@ grow mem delta = do
         fillByteArray m' oldSizeBytes (newSizeBytes - oldSizeBytes) 0
         writeMutVar (mem^.miContent) m'
 
--- Byte-wise access
-
-loadByte :: PrimMonad m
-         => MemoryInst m -> Address -> ExceptT MemoryError m Word8
-loadByte mem a = do
-  bnd <- lift $ bound mem
-  if | a >= fromIntegral bnd -> throwError MemoryBoundsError
-     | otherwise -> lift $ do
-        m <- readMutVar (mem^.miContent)
-        readByteArray m (fromIntegral a)
-
--- Vector access
-
-loadBytes :: PrimMonad m
-          => MemoryInst m -> Address -> Size
-          -> ExceptT MemoryError m (Vector Word8)
-loadBytes mem a n = V.generateM (fromIntegral n) $ \i ->
-  loadByte mem (a + fromIntegral i)
+-- Bulk access
 
 storeBytes :: PrimMonad m
-           => MemoryInst m -> Address -> Vector Word8
+           => MemoryInst m -> Address -> ByteArray
            -> ExceptT MemoryError m ()
 storeBytes mem a bs = do
   bnd <- lift $ bound mem
-  when (fromIntegral a + V.length bs > fromIntegral bnd) $
+  when (fromIntegral a + sizeofByteArray bs > fromIntegral bnd) $
        throwError MemoryBoundsError
   lift $ do
     m <- readMutVar (mem^.miContent)
-    zipWithM_ (writeByteArray m) [fromIntegral a..] (V.toList bs)
+    copyByteArray m (fromIntegral a) bs 0 (sizeofByteArray bs)
 
 -- Value access
 
@@ -253,6 +235,23 @@ storePacked sz mem a o v = do
         Pack32 -> LEBA.writeUnalignedByteArray m (fromIntegral addr) (fromIntegral @_ @Word32 y)
       _ -> throwError MemoryTypeError
 
+-- Persistence/Restore
+
+exportMemory :: PrimMonad m => MemoryInst m -> m ByteArray
+exportMemory mem = do
+    m <- readMutVar (mem^.miContent)
+    s <- getSizeofMutableByteArray m
+    m' <- newByteArray s
+    copyMutableByteArray m' 0 m 0 s
+    unsafeFreezeByteArray m'
+
+importMemory :: PrimMonad m => MemoryInst m -> ByteArray -> m ()
+importMemory mem bs = do
+    m <- readMutVar (mem^.miContent)
+    m' <- resizeMutableByteArray m (sizeofByteArray bs)
+    copyByteArray m' 0 bs 0 (sizeofByteArray bs)
+    writeMutVar (mem^.miContent) m'
+
 -- Conversions used in "Wasm.Exec.EvalNumeric"
 
 cast :: (MArray (STUArray s) a (ST s), MArray (STUArray s) b (ST s))
@@ -271,4 +270,3 @@ doubleToBits x = runST (cast x)
 
 doubleFromBits :: Int64 -> Double
 doubleFromBits x = runST (cast x)
-
